@@ -2,7 +2,7 @@ import os
 import pickle
 import matplotlib.pyplot as plt
 import re
-
+import time
 # ============================================================
 # Cache utilities for E2E time series
 # ============================================================
@@ -327,7 +327,14 @@ def _save_cache(path, obj):
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, path)
 
-
+def _log(msg, level="info", verbose=True):
+    """
+    Lightweight logger used throughout e2e_analysis.
+    """
+    if not verbose:
+        return
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{level.upper()} {ts}] {msg}")
 
 # ----------------------------
 # loader + end picking (same logic as before)
