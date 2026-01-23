@@ -83,11 +83,48 @@ def _pick_end_atoms(u, heavy_sel="not name H*"):
     return poly, heavy[i], heavy[j], f"geometry_farthest_heavy (terminals_found={len(terms)})"
 
 # ---------- unwrap + compute time series ----------
-def compute_e2e_timeseries_nm(prod_dir, xtc_name="prod.xtc", heavy_sel="not name H*"):
+def compute_e2e_timeseries_nm(
+    prod_dir,
+    xtc_name="prod.xtc",
+    heavy_sel="not name H*",
+    use_cache=True,
+    force_recompute=False,
+    normalize=None,          # NEW: None | "per_carbon" | "fraction" | "relative"
+    carbon_count=None,       # NEW: override if you already know N_C (e.g., 20, 200)
+):
+    
     u, topo, xtc = _load_universe(prod_dir, xtc_name=xtc_name)
 
     # pick ends once (on frame 0)
     poly, a1, a2, method = _pick_end_atoms(u, heavy_sel=heavy_sel)
+
+    # after: poly, a1, a2, method = _pick_end_atoms(...)
+    nC = int(carbon_count) if carbon_count is not None else _count_polymer_carbons(poly)
+
+    # default: no normalization
+    norm_label = "raw"
+    norm_factor = 1.0
+
+    if normalize in ("per_carbon", "perC"):
+        if nC <= 0:
+            raise RuntimeError("normalize='per_carbon' but carbon count is 0/unknown.")
+        norm_factor = float(nC)
+        norm_label = f"per_carbon (nC={nC})"
+
+    elif normalize in ("fraction", "frac", "per_bond"):
+        # typical "max" steps ~ (nC-1); avoids division by 0 for tiny chains
+        denom = max(1, nC - 1)
+        norm_factor = float(denom)
+        norm_label = f"fraction (nC={nC})"
+
+    elif normalize in ("relative",):
+        # we’ll do relative after we compute the raw distances
+        norm_label = "relative"
+
+    elif normalize is None:
+        pass
+    else:
+        raise ValueError("normalize must be None, 'per_carbon', 'fraction', or 'relative'")
 
     # UNWRAP polymer across PBC so intramolecular distance is continuous
     # This is the key fix for "crazy high" distances.
@@ -107,6 +144,16 @@ def compute_e2e_timeseries_nm(prod_dir, xtc_name="prod.xtc", heavy_sel="not name
     times_ps = np.asarray(times_ps, float)
     dists_nm = np.asarray(dists_nm, float)
 
+
+    if normalize == "relative":
+        mu = float(np.mean(dists_nm)) if len(dists_nm) else 1.0
+        if mu == 0:
+            mu = 1.0
+        dists_nm = dists_nm / mu
+    else:
+        dists_nm = dists_nm / norm_factor
+
+    
     meta = {
         "prod_dir": prod_dir,
         "topology": topo,
@@ -119,6 +166,9 @@ def compute_e2e_timeseries_nm(prod_dir, xtc_name="prod.xtc", heavy_sel="not name
         "mean_nm": float(np.mean(dists_nm)),
         "std_nm": float(np.std(dists_nm, ddof=1)) if len(dists_nm) > 1 else 0.0,
         "box_firstframe": u.trajectory[0].dimensions,
+        "nC": int(nC),
+        "normalize": normalize, 
+        "normalize_label": norm_label,   
     }
     return times_ps, dists_nm, meta
 
@@ -203,6 +253,39 @@ def plot_e2e(prod_dir, mode="time", burn_in=0.0, downsample=1,
     print("box (first frame):", meta["box_firstframe"])
 
     return t, d, meta
+
+def _count_polymer_carbons(poly):
+    """
+    Robust carbon counter for the polymer AtomGroup.
+    Tries 'element C' first; falls back to name/type heuristics.
+    """
+    # Try element if available
+    try:
+        nC = len(poly.select_atoms("element C"))
+        if nC > 0:
+            return int(nC)
+    except Exception:
+        pass
+
+    # Fallback: names
+    try:
+        nC = len(poly.select_atoms("name C*"))
+        if nC > 0:
+            return int(nC)
+    except Exception:
+        pass
+
+    # Fallback: types
+    try:
+        nC = len(poly.select_atoms("type C"))
+        if nC > 0:
+            return int(nC)
+    except Exception:
+        pass
+
+    # Last resort: count atoms whose name starts with "C"
+    names = [getattr(a, "name", "").upper() for a in poly.atoms]
+    return int(sum(n.startswith("C") for n in names))
 
 
 def _cache_path(prod_dir):
@@ -492,7 +575,28 @@ def compute_e2e_timeseries_nm(
     heavy_sel="not name H*",
     use_cache=True,
     force_recompute=False,
+    # NEW:
+    normalize=None,          # None | "per_carbon" | "fraction" | "relative"
+    carbon_count=None,       # int override, e.g. 200 if counting is unreliable
+    # optional UX:
+    verbose=False,
+    show_progress=False,
+    pbar_desc=None,
+    pbar_leave=False,
 ):
+    """
+    Compute end-to-end distance time series for a /prod directory.
+
+    Returns:
+      times_ps (np.ndarray), dists (np.ndarray), meta (dict)
+
+    Distances are in nm by default (same as your existing pipeline).
+    Normalization (applied AFTER E2E computed in nm):
+      - None: raw nm
+      - "per_carbon": nm / N_C
+      - "fraction": nm / (N_C - 1)
+      - "relative": d / mean(d)  (unitless)
+    """
     cache_file = _cache_path(prod_dir)
     cache = _load_cache(cache_file) if use_cache else {}
 
@@ -502,38 +606,77 @@ def compute_e2e_timeseries_nm(
         "topology": _file_sig(topo),
         "trajectory": _file_sig(xtc),
         "heavy_sel": heavy_sel,
-        "version": "e2e_unwrap_v1",
+        "xtc_name": xtc_name,
+        "normalize": normalize,
+        "carbon_count": carbon_count,
+        "version": "e2e_unwrap_v3_norm",
     }
 
-    # ---------------- cache hit ----------------
-    if (
-        use_cache
-        and not force_recompute
-        and cache.get("signature") == signature
-    ):
+    # ---- cache hit ----
+    if use_cache and (not force_recompute) and cache.get("signature") == signature:
         out = cache["data"]
-        return (
-            out["times_ps"],
-            out["dists_nm"],
-            out["meta"],
-        )
+        if verbose:
+            _log(f"Cache HIT: {prod_dir}", "info", verbose=True)
+        return out["times_ps"], out["dists_nm"], out["meta"]
 
-    # ---------------- compute ----------------
+    if verbose:
+        if use_cache:
+            _log(f"Cache MISS/STALE: {prod_dir}", "warn", verbose=True)
+        _log(f"  topology  : {topo}", "info", verbose=True)
+        _log(f"  trajectory: {xtc}", "info", verbose=True)
+
+    # pick ends once
     poly, a1, a2, method = _pick_end_atoms(u, heavy_sel=heavy_sel)
 
+    # unwrap polymer for correct intramolecular distances
     from MDAnalysis.transformations import unwrap
     u.trajectory.add_transformations(unwrap(poly))
 
-    times_ps = []
-    dists_nm = []
+    # carbon count for normalization
+    nC = int(carbon_count) if carbon_count is not None else _count_polymer_carbons(poly)
 
-    for ts in u.trajectory:
+    # prealloc arrays
+    n_frames = len(u.trajectory)
+    times_ps = np.empty(n_frames, dtype=float)
+    dists_nm = np.empty(n_frames, dtype=float)
+
+    iterator = u.trajectory
+    if show_progress:
+        desc = pbar_desc or f"E2E {os.path.basename(os.path.dirname(prod_dir))}/{os.path.basename(prod_dir)}"
+        iterator = tqdm(iterator, total=n_frames, desc=desc, leave=pbar_leave)
+
+    # compute raw nm
+    for i, ts in enumerate(iterator):
+        # positions are in Å after unwrap
         d_ang = np.linalg.norm(a1.position - a2.position)
-        dists_nm.append(d_ang / 10.0)
-        times_ps.append(ts.time)
+        dists_nm[i] = d_ang / 10.0
+        times_ps[i] = ts.time
 
-    times_ps = np.asarray(times_ps, float)
-    dists_nm = np.asarray(dists_nm, float)
+    # apply normalization
+    norm_label = "raw"
+    if normalize is None:
+        pass
+    elif normalize in ("per_carbon", "perC"):
+        if nC <= 0:
+            raise RuntimeError("normalize='per_carbon' but could not determine N_C (carbon count <= 0).")
+        dists_nm = dists_nm / float(nC)
+        norm_label = f"per_carbon (nC={nC})"
+    elif normalize in ("fraction", "frac", "per_bond"):
+        denom = max(1, nC - 1)
+        dists_nm = dists_nm / float(denom)
+        norm_label = f"fraction (nC={nC})"
+    elif normalize in ("relative",):
+        mu = float(np.mean(dists_nm)) if len(dists_nm) else 1.0
+        if mu == 0:
+            mu = 1.0
+        dists_nm = dists_nm / mu
+        norm_label = "relative (d/mean)"
+    else:
+        raise ValueError("normalize must be None, 'per_carbon', 'fraction', or 'relative'")
+
+    # meta
+    u.trajectory[0]
+    box_first = u.trajectory.ts.dimensions.copy()
 
     meta = {
         "prod_dir": prod_dir,
@@ -543,20 +686,20 @@ def compute_e2e_timeseries_nm(
         "end_atom_names": (a1.name, a2.name),
         "end_atom_types": (getattr(a1, "type", None), getattr(a2, "type", None)),
         "end_method_used": method,
-        "n_frames": int(len(times_ps)),
+        "n_frames": int(n_frames),
         "mean_nm": float(np.mean(dists_nm)),
         "std_nm": float(np.std(dists_nm, ddof=1)) if len(dists_nm) > 1 else 0.0,
+        "box_firstframe": box_first,
+        "nC": int(nC),
+        "normalize": normalize,
+        "normalize_label": norm_label,
     }
 
+    # save cache
     if use_cache:
-        _save_cache(cache_file, {
-            "signature": signature,
-            "data": {
-                "times_ps": times_ps,
-                "dists_nm": dists_nm,
-                "meta": meta,
-            },
-        })
+        _save_cache(cache_file, {"signature": signature, "data": {"times_ps": times_ps, "dists_nm": dists_nm, "meta": meta}})
+        if verbose:
+            _log(f"Cache SAVE: {cache_file}", "info", verbose=True)
 
     return times_ps, dists_nm, meta
 
@@ -636,302 +779,184 @@ def compute_e2e_run_means(run1_prod_dir, runs=(1,2,3), burn_in=0.0, downsample=1
     }
 
 def plot_e2e_overlay(
-    prod_dirs_or_run1_dirs,
+    run1_prod_dirs,
     labels=None,
-    mode="kde",                 # "kde" or "time"
+    runs=None,                    # e.g. (1,2,3) expands each /run1/prod
+    mode="kde",                   # "kde" or "time"
+    combine="pool",               # "average" | "pool" | "both"
     burn_in=0.0,
     downsample=1,
-    rolling_window=None,
+    units="A",                    # "A" or "nm" (only affects display scaling)
+    show_individual_runs=False,
+    # NEW:
+    normalize=None,               # None | "per_carbon" | "fraction" | "relative"
+    carbon_count=None,            # override N_C if desired
     kde_bw_method="scott",
     kde_bw=None,
-    kde_shared_grid=True,
     gridsize=400,
     cut=3.0,
-    units="A",                  # "nm" or "A"
-    save_plot=None,
-    figsize=(24, 10),
+    figsize=(12, 5),
+    save_plot=None,               # <<<<<< keep this name
     dpi=300,
-    # run expansion
-    runs=None,                  # e.g., (1,2,3) means inputs are run1/prod and we auto-expand
-    # NEW: combine behavior
-    combine="average",          # "average" | "pool" | "both"
-    show_individual_runs=False, # if True, plots each run faintly
-    errorbars="sem",            # 'sem' or 'std' for reporting average-mode uncertainty
-    heavy_sel="not name H*",
-    xtc_name="prod.xtc",
-    use_cache=True,
-    force_recompute=False,
+    verbose=True,
+    show_progress=False,
 ):
-    import os
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-
+    if labels is None:
+        labels = [f"cond_{i+1}" for i in range(len(run1_prod_dirs))]
+    if len(labels) != len(run1_prod_dirs):
+        raise ValueError("labels must match length of run1_prod_dirs")
     if combine not in ("average", "pool", "both"):
         raise ValueError("combine must be 'average', 'pool', or 'both'")
 
-    # units scaling
+    # Units scaling for display only
     if units.lower() in ["a", "å", "angstrom", "angstroms"]:
         scale = 10.0
-        x_unit = "Å"
+        unit_str = "Å"
     else:
         scale = 1.0
-        x_unit = "nm"
+        unit_str = "nm"
 
-    downsample = int(max(1, downsample))
+    # Label for normalized quantity
+    if normalize is None:
+        x_label = f"End-to-End Distance ({unit_str})"
+    elif normalize in ("per_carbon", "perC"):
+        x_label = f"E2E / N_C ({unit_str}/C)"
+    elif normalize in ("fraction", "frac", "per_bond"):
+        x_label = f"E2E / (N_C-1) ({unit_str})"
+    elif normalize in ("relative",):
+        x_label = "E2E / ⟨E2E⟩ (unitless)"
+        scale = 1.0
+        unit_str = "unitless"
+    else:
+        x_label = f"End-to-End Distance ({unit_str})"
 
-    inputs = list(prod_dirs_or_run1_dirs)
-    if labels is None:
-        labels = [f"cond_{i+1}" for i in range(len(inputs))]
-    if len(labels) != len(inputs):
-        raise ValueError("labels must match length of prod_dirs_or_run1_dirs")
+    plt.figure(figsize=figsize)
 
-    def _apply_burnin_downsample(times, dists):
-        if burn_in and 0.0 < burn_in < 1.0:
-            start = int(len(dists) * burn_in)
-            times = times[start:]
-            dists = dists[start:]
-        return times[::downsample], dists[::downsample]
-
-    def _get_series(prod_dir):
-        t, d_nm, meta = compute_e2e_timeseries_nm(
-            prod_dir, xtc_name=xtc_name, heavy_sel=heavy_sel,
-            use_cache=use_cache, force_recompute=force_recompute
-        )
-        t_plot, d_plot_nm = _apply_burnin_downsample(t, d_nm)
-        return t_plot, d_plot_nm, meta
-
-    # ---- solvent classifier (uses label first, then falls back to path) ----
-    def _solvent_kind(label, base):
-        s = (label or "").lower()
-        b = str(base).lower()
-
-        if ("1-2-dcb" in s) or ("1_2_dcb" in s) or ("1-2-dcb" in b) or ("1_2_dcb" in b):
-            return "12"
-        if ("1-4-dcb" in s) or ("1_4_dcb" in s) or ("1-4-dcb" in b) or ("1_4_dcb" in b):
-            return "14"
-        return "other"
-
-    # ======================================================================
-    # PASS 1: count how many *conditions* per solvent we will actually plot
-    # (i.e., inputs that have at least one valid run/prod we can load)
-    # ======================================================================
-    cond_kind = []  # one entry per input: "12" | "14" | "other"
-    will_plot = []  # bool per input
-    for base, lab in zip(inputs, labels):
-        kind = _solvent_kind(lab, base)
-        prod_list = [base] if runs is None else expand_run_prod_dirs(base, runs=runs)
-
-        any_valid = False
-        for pd in prod_list:
-            if not (os.path.isdir(pd) and os.path.isfile(os.path.join(pd, xtc_name))):
-                continue
-            try:
-                _, d_nm, _ = _get_series(pd)
-                if len(d_nm) >= 2:
-                    any_valid = True
-                    break
-            except Exception:
-                continue
-
-        cond_kind.append(kind)
-        will_plot.append(any_valid)
-
-    n_12 = sum(1 for k, ok in zip(cond_kind, will_plot) if ok and k == "12")
-    n_14 = sum(1 for k, ok in zip(cond_kind, will_plot) if ok and k == "14")
-    n_other = sum(1 for k, ok in zip(cond_kind, will_plot) if ok and k == "other")
-
-    # create palettes sized to detected conditions
-    # (minimum 1 so iterators don't error)
-    pal_12 = sns.color_palette("rocket_r")
-    pal_14 = sns.color_palette("viridis")
-    pal_ot = sns.color_palette("deep")
-
-    # iterators we’ll consume as we encounter each condition of that type
-    i12 = iter(pal_12)
-    i14 = iter(pal_14)
-    iot = iter(pal_ot)
-
-    def _next_cond_color(kind):
-        if kind == "12":
-            return next(i12)
-        if kind == "14":
-            return next(i14)
-        return next(iot)
-
-    # ======================================================================
-    # Optional shared KDE grid across ALL curves
-    # ======================================================================
-    kde_grid_nm = None
-    if mode.lower() == "kde" and kde_shared_grid:
-        pooled_all = []
-        for base in inputs:
+    # Build shared KDE grid across all series to average densities cleanly
+    shared_grid = None
+    if mode.lower() == "kde":
+        all_samples = []
+        for base in run1_prod_dirs:
             prod_list = [base] if runs is None else expand_run_prod_dirs(base, runs=runs)
             for pd in prod_list:
-                if os.path.isdir(pd) and os.path.isfile(os.path.join(pd, xtc_name)):
-                    try:
-                        _, d_nm, _ = _get_series(pd)
-                        if len(d_nm) > 1:
-                            pooled_all.append(d_nm)
-                    except Exception:
-                        pass
-        if len(pooled_all) > 0:
-            pooled_all = np.concatenate(pooled_all)
-            _, _, bw_ref = gaussian_kde_1d(pooled_all, gridsize=50, bw_method=kde_bw_method, bw=kde_bw, cut=cut)
-            lo = float(np.min(pooled_all) - cut * bw_ref)
-            hi = float(np.max(pooled_all) + cut * bw_ref)
-            kde_grid_nm = np.linspace(lo, hi, gridsize)
+                try:
+                    t, d, _ = compute_e2e_timeseries_nm(
+                        pd,
+                        verbose=False,
+                        show_progress=False,
+                        normalize=normalize,
+                        carbon_count=carbon_count,
+                    )
+                    _, d2 = _apply_burnin_downsample(t, d, burn_in=burn_in, downsample=downsample)
+                    if len(d2) > 1:
+                        all_samples.append(d2)
+                except Exception:
+                    pass
 
-    # ======================================================================
-    # PASS 2: plotting (same logic, now with dynamic palettes)
-    # ======================================================================
-    plt.figure(figsize=figsize)
-    summaries = []
+        if len(all_samples) == 0:
+            raise RuntimeError("No valid data found to build KDE grid (all runs failed?).")
 
-    for base, lab, kind, ok in zip(inputs, labels, cond_kind, will_plot):
-        if not ok:
-            continue
+        pooled = np.concatenate(all_samples)
+        # get a reference bandwidth to set grid padding
+        _, _, bw_ref = gaussian_kde_1d(pooled, gridsize=50, bw_method=kde_bw_method, bw=kde_bw, cut=cut)
+        lo = np.min(pooled) - cut * bw_ref
+        hi = np.max(pooled) + cut * bw_ref
+        shared_grid = np.linspace(lo, hi, gridsize)
 
-        # one "base color" per condition (distinct shades per solvent family)
-        base_color = _next_cond_color(kind)
-
-        # for pool vs average, use two closely related tones derived from base_color
-        # (keeps family consistent but lets you see solid vs dashed easier)
-        c_pool = base_color
-        c_avg = base_color
-
+    # Plot each condition
+    for base, lab in zip(run1_prod_dirs, labels):
         prod_list = [base] if runs is None else expand_run_prod_dirs(base, runs=runs)
 
-        series_list = []
+        series = []
         for pd in prod_list:
-            if not (os.path.isdir(pd) and os.path.isfile(os.path.join(pd, xtc_name))):
-                print(f"[skip] missing {xtc_name} or dir: {pd}")
+            if not os.path.isdir(pd):
+                _log(f"[skip] {pd}: not a directory", "warn", verbose)
                 continue
             try:
-                t_plot, d_plot_nm, meta = _get_series(pd)
+                t, d, meta = compute_e2e_timeseries_nm(
+                    pd,
+                    verbose=verbose,
+                    show_progress=show_progress,
+                    normalize=normalize,
+                    carbon_count=carbon_count,
+                )
+                t2, d2 = _apply_burnin_downsample(t, d, burn_in=burn_in, downsample=downsample)
+                if len(d2) >= 2:
+                    series.append((pd, t2, d2, meta))
             except Exception as e:
-                print(f"[skip] {pd}: {e}")
-                continue
-            if len(d_plot_nm) < 2:
-                print(f"[skip] {pd}: not enough frames after burn-in/downsample")
-                continue
-            series_list.append((pd, t_plot, d_plot_nm, meta))
+                _log(f"[skip] {pd}: {e}", "warn", verbose)
 
-        if len(series_list) == 0:
+        if len(series) == 0:
+            _log(f"[skip] no valid runs for: {base}", "warn", verbose)
             continue
 
-        # Optionally show each run faintly (same condition color, just alpha)
-        if show_individual_runs:
-            if mode.lower() == "kde":
-                for (pd, _, d_nm, _) in series_list:
-                    g, dens, _ = gaussian_kde_1d(
-                        d_nm, grid=kde_grid_nm, gridsize=gridsize,
-                        bw_method=kde_bw_method, bw=kde_bw, cut=cut
-                    )
-                    plt.plot(g * scale, dens, lw=1.0, alpha=0.20, color=base_color)
-            else:
-                for (pd, t_plot, d_nm, _) in series_list:
-                    plt.plot(t_plot, d_nm * scale, lw=1.0, alpha=0.20, color=base_color)
+        if show_individual_runs and mode.lower() == "kde":
+            for (pd, _, d2, _) in series:
+                g, dens, _ = gaussian_kde_1d(
+                    d2,
+                    grid=shared_grid,
+                    gridsize=gridsize,
+                    bw_method=kde_bw_method,
+                    bw=kde_bw,
+                    cut=cut,
+                )
+                plt.plot(g * scale, dens, lw=1.0, alpha=0.25)
 
-        # ----------------------------
-        # combine logic
-        # ----------------------------
-        run_means = np.array([float(np.mean(d_nm)) for (_, _, d_nm, _) in series_list])
-        n_runs = len(run_means)
-        mean_of_means = float(np.mean(run_means))
-        std_runs = float(np.std(run_means, ddof=1)) if n_runs > 1 else 0.0
-        sem_runs = float(std_runs / np.sqrt(n_runs)) if n_runs > 1 else 0.0
-        err = sem_runs if errorbars == "sem" else std_runs
-
-        pooled = np.concatenate([d_nm for (_, _, d_nm, _) in series_list])
-
-        # ----- KDE mode -----
         if mode.lower() == "kde":
-            # pooled KDE
             if combine in ("pool", "both"):
-                g, dens, bw = gaussian_kde_1d(
-                    pooled, grid=kde_grid_nm, gridsize=gridsize,
-                    bw_method=kde_bw_method, bw=kde_bw, cut=cut
+                pooled = np.concatenate([d2 for (_, _, d2, _) in series])
+                g, dens, _ = gaussian_kde_1d(
+                    pooled,
+                    grid=shared_grid,
+                    gridsize=gridsize,
+                    bw_method=kde_bw_method,
+                    bw=kde_bw,
+                    cut=cut,
                 )
-                plt.plot(
-                    g * scale, dens, lw=2.6, color=c_pool,
-                    label=f"{lab} pool (n_runs={n_runs})"
-                )
+                plt.plot(g * scale, dens, lw=2.6, label=f"{lab} pool")
 
-            # average-of-KDEs
             if combine in ("average", "both"):
                 dens_list = []
-                for (_, _, d_nm, _) in series_list:
+                for (_, _, d2, _) in series:
                     g, dens_r, _ = gaussian_kde_1d(
-                        d_nm, grid=kde_grid_nm, gridsize=gridsize,
-                        bw_method=kde_bw_method, bw=kde_bw, cut=cut
+                        d2,
+                        grid=shared_grid,
+                        gridsize=gridsize,
+                        bw_method=kde_bw_method,
+                        bw=kde_bw,
+                        cut=cut,
                     )
                     dens_list.append(dens_r)
                 dens_avg = np.mean(np.vstack(dens_list), axis=0)
-                plt.plot(
-                    g * scale, dens_avg, lw=2.2, ls="--", color=c_avg,
-                    label=f"{lab} average (μ={mean_of_means*scale:.1f}{x_unit}, {errorbars}={err*scale:.1f}{x_unit})"
-                )
+                plt.plot(g * scale, dens_avg, lw=2.2, ls="--", label=f"{lab} average")
 
-        # ----- TIME mode -----
         else:
-            if combine in ("average", "both"):
-                t0 = series_list[0][1]
-                same_time = all(len(t0) == len(ti) and np.allclose(t0, ti) for (_, ti, _, _) in series_list[1:])
-                if same_time:
-                    D = np.vstack([d_nm for (_, _, d_nm, _) in series_list])
-                    d_mean = np.mean(D, axis=0)
-                    plt.plot(t0, d_mean * scale, lw=2.6, color=c_avg,
-                             label=f"{lab} avg (μ={mean_of_means*scale:.1f}{x_unit})")
-                else:
-                    plt.plot([], [], color=c_avg,
-                             label=f"{lab} avg (μ={mean_of_means*scale:.1f}{x_unit})")
+            # time plot
+            t0 = series[0][1]
+            same_time = all(len(t0) == len(ti) and np.allclose(t0, ti) for (_, ti, _, _) in series[1:])
 
-            if combine in ("pool", "both"):
-                pooled_mean = float(np.mean(pooled))
-                plt.plot([], [], color=c_pool,
-                         label=f"{lab} pool (μ={pooled_mean*scale:.1f}{x_unit})")
+            if combine in ("average", "both") and same_time:
+                D = np.vstack([d2 for (_, _, d2, _) in series])
+                plt.plot(t0, np.mean(D, axis=0) * scale, lw=2.6, label=f"{lab} avg")
+            else:
+                pd, t2, d2, _ = series[0]
+                plt.plot(t2, d2 * scale, lw=1.6, label=f"{lab} (run1)")
 
-        # record summary
-        pooled_mean = float(np.mean(pooled))
-        pooled_std = float(np.std(pooled, ddof=1)) if len(pooled) > 1 else 0.0
-        summaries.append({
-            "label": lab,
-            "n_runs": n_runs,
-            "run_means_nm": run_means,
-            "mean_of_means_nm": mean_of_means,
-            "std_across_runs_nm": std_runs,
-            "sem_across_runs_nm": sem_runs,
-            "pooled_mean_nm": pooled_mean,
-            "pooled_std_nm": pooled_std,
-        })
-
-    # finalize plot
+    # finalize
     if mode.lower() == "kde":
-        plt.xlabel(f"End-to-End Distance ({x_unit})")
+        plt.xlabel(x_label)
         plt.ylabel("Density")
-        plt.title(f"E2E KDE overlay | combine={combine} | burn_in={burn_in} | downsample={downsample}")
+        plt.title(f"E2E KDE overlay | combine={combine} | burn_in={burn_in} | downsample={downsample} | normalize={normalize}")
     else:
         plt.xlabel("Time (ps)")
-        plt.ylabel(f"End-to-End Distance ({x_unit})")
-        plt.title(f"E2E time overlay | combine={combine} | burn_in={burn_in} | downsample={downsample}")
+        plt.ylabel(x_label)
+        plt.title(f"E2E time overlay | combine={combine} | burn_in={burn_in} | downsample={downsample} | normalize={normalize}")
 
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-
     if save_plot:
         os.makedirs(os.path.dirname(save_plot), exist_ok=True)
         plt.savefig(save_plot, dpi=dpi)
     plt.show()
 
-    # print summary
-    if len(summaries) > 0:
-        print("\n=== Summary (per condition) ===")
-        for s in summaries:
-            errv = s["sem_across_runs_nm"] if errorbars == "sem" else s["std_across_runs_nm"]
-            print(f"{s['label']}:")
-            print(f"  average: mean_of_means={s['mean_of_means_nm']*scale:.3f}{x_unit}  {errorbars}={errv*scale:.3f}{x_unit}  n_runs={s['n_runs']}")
-            print(f"  pool   : pooled_mean   ={s['pooled_mean_nm']*scale:.3f}{x_unit}  pooled_std={s['pooled_std_nm']*scale:.3f}{x_unit}  n_samples={len(s['run_means_nm'])} runs")
-
-    return summaries
