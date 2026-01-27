@@ -83,176 +83,176 @@ def _pick_end_atoms(u, heavy_sel="not name H*"):
     return poly, heavy[i], heavy[j], f"geometry_farthest_heavy (terminals_found={len(terms)})"
 
 # ---------- unwrap + compute time series ----------
-def compute_e2e_timeseries_nm(
-    prod_dir,
-    xtc_name="prod.xtc",
-    heavy_sel="not name H*",
-    use_cache=True,
-    force_recompute=False,
-    normalize=None,          # NEW: None | "per_carbon" | "fraction" | "relative"
-    carbon_count=None,       # NEW: override if you already know N_C (e.g., 20, 200)
-):
+# def compute_e2e_timeseries_nm(
+#     prod_dir,
+#     xtc_name="prod.xtc",
+#     heavy_sel="not name H*",
+#     use_cache=True,
+#     force_recompute=False,
+#     normalize=None,          # NEW: None | "per_carbon" | "fraction" | "relative"
+#     carbon_count=None,       # NEW: override if you already know N_C (e.g., 20, 200)
+# ):
     
-    u, topo, xtc = _load_universe(prod_dir, xtc_name=xtc_name)
+#     u, topo, xtc = _load_universe(prod_dir, xtc_name=xtc_name)
 
-    # pick ends once (on frame 0)
-    poly, a1, a2, method = _pick_end_atoms(u, heavy_sel=heavy_sel)
+#     # pick ends once (on frame 0)
+#     poly, a1, a2, method = _pick_end_atoms(u, heavy_sel=heavy_sel)
 
-    # after: poly, a1, a2, method = _pick_end_atoms(...)
-    nC = int(carbon_count) if carbon_count is not None else _count_polymer_carbons(poly)
+#     # after: poly, a1, a2, method = _pick_end_atoms(...)
+#     nC = int(carbon_count) if carbon_count is not None else _count_polymer_carbons(poly)
 
-    # default: no normalization
-    norm_label = "raw"
-    norm_factor = 1.0
+#     # default: no normalization
+#     norm_label = "raw"
+#     norm_factor = 1.0
 
-    if normalize in ("per_carbon", "perC"):
-        if nC <= 0:
-            raise RuntimeError("normalize='per_carbon' but carbon count is 0/unknown.")
-        norm_factor = float(nC)
-        norm_label = f"per_carbon (nC={nC})"
+#     if normalize in ("per_carbon", "perC"):
+#         if nC <= 0:
+#             raise RuntimeError("normalize='per_carbon' but carbon count is 0/unknown.")
+#         norm_factor = float(nC)
+#         norm_label = f"per_carbon (nC={nC})"
 
-    elif normalize in ("fraction", "frac", "per_bond"):
-        # typical "max" steps ~ (nC-1); avoids division by 0 for tiny chains
-        denom = max(1, nC - 1)
-        norm_factor = float(denom)
-        norm_label = f"fraction (nC={nC})"
+#     elif normalize in ("fraction", "frac", "per_bond"):
+#         # typical "max" steps ~ (nC-1); avoids division by 0 for tiny chains
+#         denom = max(1, nC - 1)
+#         norm_factor = float(denom)
+#         norm_label = f"fraction (nC={nC})"
 
-    elif normalize in ("relative",):
-        # we’ll do relative after we compute the raw distances
-        norm_label = "relative"
+#     elif normalize in ("relative",):
+#         # we’ll do relative after we compute the raw distances
+#         norm_label = "relative"
 
-    elif normalize is None:
-        pass
-    else:
-        raise ValueError("normalize must be None, 'per_carbon', 'fraction', or 'relative'")
+#     elif normalize is None:
+#         pass
+#     else:
+#         raise ValueError("normalize must be None, 'per_carbon', 'fraction', or 'relative'")
 
-    # UNWRAP polymer across PBC so intramolecular distance is continuous
-    # This is the key fix for "crazy high" distances.
-    from MDAnalysis.transformations import unwrap
-    u.trajectory.add_transformations(unwrap(poly))
+#     # UNWRAP polymer across PBC so intramolecular distance is continuous
+#     # This is the key fix for "crazy high" distances.
+#     from MDAnalysis.transformations import unwrap
+#     u.trajectory.add_transformations(unwrap(poly))
 
-    times_ps = []
-    dists_nm = []
+#     times_ps = []
+#     dists_nm = []
 
-    for ts in u.trajectory:
-        # After unwrapping, compute simple Euclidean distance
-        d_ang = np.linalg.norm(a1.position - a2.position)   # Å
-        d_nm = d_ang / 10.0                                 # convert Å -> nm
-        times_ps.append(ts.time)
-        dists_nm.append(d_nm)
+#     for ts in u.trajectory:
+#         # After unwrapping, compute simple Euclidean distance
+#         d_ang = np.linalg.norm(a1.position - a2.position)   # Å
+#         d_nm = d_ang / 10.0                                 # convert Å -> nm
+#         times_ps.append(ts.time)
+#         dists_nm.append(d_nm)
 
-    times_ps = np.asarray(times_ps, float)
-    dists_nm = np.asarray(dists_nm, float)
+#     times_ps = np.asarray(times_ps, float)
+#     dists_nm = np.asarray(dists_nm, float)
 
 
-    if normalize == "relative":
-        mu = float(np.mean(dists_nm)) if len(dists_nm) else 1.0
-        if mu == 0:
-            mu = 1.0
-        dists_nm = dists_nm / mu
-    else:
-        dists_nm = dists_nm / norm_factor
+#     if normalize == "relative":
+#         mu = float(np.mean(dists_nm)) if len(dists_nm) else 1.0
+#         if mu == 0:
+#             mu = 1.0
+#         dists_nm = dists_nm / mu
+#     else:
+#         dists_nm = dists_nm / norm_factor
 
     
-    meta = {
-        "prod_dir": prod_dir,
-        "topology": topo,
-        "trajectory": xtc,
-        "end_atoms_0based": (int(a1.index), int(a2.index)),
-        "end_atom_names": (a1.name, a2.name),
-        "end_atom_types": (getattr(a1, "type", None), getattr(a2, "type", None)),
-        "end_method_used": method,
-        "n_frames": int(len(times_ps)),
-        "mean_nm": float(np.mean(dists_nm)),
-        "std_nm": float(np.std(dists_nm, ddof=1)) if len(dists_nm) > 1 else 0.0,
-        "box_firstframe": u.trajectory[0].dimensions,
-        "nC": int(nC),
-        "normalize": normalize, 
-        "normalize_label": norm_label,   
-    }
-    return times_ps, dists_nm, meta
+#     meta = {
+#         "prod_dir": prod_dir,
+#         "topology": topo,
+#         "trajectory": xtc,
+#         "end_atoms_0based": (int(a1.index), int(a2.index)),
+#         "end_atom_names": (a1.name, a2.name),
+#         "end_atom_types": (getattr(a1, "type", None), getattr(a2, "type", None)),
+#         "end_method_used": method,
+#         "n_frames": int(len(times_ps)),
+#         "mean_nm": float(np.mean(dists_nm)),
+#         "std_nm": float(np.std(dists_nm, ddof=1)) if len(dists_nm) > 1 else 0.0,
+#         "box_firstframe": u.trajectory[0].dimensions,
+#         "nC": int(nC),
+#         "normalize": normalize, 
+#         "normalize_label": norm_label,   
+#     }
+#     return times_ps, dists_nm, meta
 
 # ---------- simple KDE ----------
-def gaussian_kde_1d(x, gridsize=400, bw_method="scott", bw=None, cut=3.0):
-    x = np.asarray(x, float)
-    x = x[np.isfinite(x)]
-    n = len(x)
-    if n < 2:
-        raise ValueError("Need >=2 samples for KDE.")
-    std = np.std(x, ddof=1)
+# def gaussian_kde_1d(x, gridsize=400, bw_method="scott", bw=None, cut=3.0):
+#     x = np.asarray(x, float)
+#     x = x[np.isfinite(x)]
+#     n = len(x)
+#     if n < 2:
+#         raise ValueError("Need >=2 samples for KDE.")
+#     std = np.std(x, ddof=1)
 
-    if bw is None:
-        if bw_method == "silverman":
-            iqr = np.subtract(*np.percentile(x, [75, 25]))
-            s = min(std, iqr / 1.34) if np.isfinite(iqr) and iqr > 0 else std
-            bw = 0.9 * s * n ** (-1/5)
-        else:
-            bw = std * n ** (-1/5)
-        if not np.isfinite(bw) or bw <= 0:
-            bw = max(std, 1e-6) * 0.1
+#     if bw is None:
+#         if bw_method == "silverman":
+#             iqr = np.subtract(*np.percentile(x, [75, 25]))
+#             s = min(std, iqr / 1.34) if np.isfinite(iqr) and iqr > 0 else std
+#             bw = 0.9 * s * n ** (-1/5)
+#         else:
+#             bw = std * n ** (-1/5)
+#         if not np.isfinite(bw) or bw <= 0:
+#             bw = max(std, 1e-6) * 0.1
 
-    lo = np.min(x) - cut * bw
-    hi = np.max(x) + cut * bw
-    grid = np.linspace(lo, hi, gridsize)
-    diff = (grid[:, None] - x[None, :]) / bw
-    dens = np.exp(-0.5 * diff**2).sum(axis=1) / (n * bw * np.sqrt(2*np.pi))
-    return grid, dens, bw
+#     lo = np.min(x) - cut * bw
+#     hi = np.max(x) + cut * bw
+#     grid = np.linspace(lo, hi, gridsize)
+#     diff = (grid[:, None] - x[None, :]) / bw
+#     dens = np.exp(-0.5 * diff**2).sum(axis=1) / (n * bw * np.sqrt(2*np.pi))
+#     return grid, dens, bw
 
 # ---------- plot: time or KDE ----------
-def plot_e2e(prod_dir, mode="time", burn_in=0.0, downsample=1,
-             rolling_window=None, kde_bw_method="scott", kde_bw=None,
-             save_plot=None, figsize=(12,5)):
-    t, d, meta = compute_e2e_timeseries_nm(prod_dir)
+# def plot_e2e(prod_dir, mode="time", burn_in=0.0, downsample=1,
+#              rolling_window=None, kde_bw_method="scott", kde_bw=None,
+#              save_plot=None, figsize=(12,5)):
+#     t, d, meta = compute_e2e_timeseries_nm(prod_dir)
 
-    # burn-in fraction
-    if burn_in and 0.0 < burn_in < 1.0:
-        start = int(len(d) * burn_in)
-        t = t[start:]
-        d = d[start:]
+#     # burn-in fraction
+#     if burn_in and 0.0 < burn_in < 1.0:
+#         start = int(len(d) * burn_in)
+#         t = t[start:]
+#         d = d[start:]
 
-    downsample = int(max(1, downsample))
-    t_plot = t[::downsample]
-    d_plot = d[::downsample]
+#     downsample = int(max(1, downsample))
+#     t_plot = t[::downsample]
+#     d_plot = d[::downsample]
 
-    plt.figure(figsize=figsize)
+#     plt.figure(figsize=figsize)
 
-    if mode.lower() == "time":
-        plt.plot(t_plot, d_plot, lw=1.2, label="E2E (nm)")
-        if rolling_window is not None and rolling_window >= 2 and len(d_plot) >= rolling_window:
-            w = int(rolling_window)
-            kernel = np.ones(w) / w
-            d_roll = np.convolve(d_plot, kernel, mode="valid")
-            t_roll = t_plot[w-1:]
-            plt.plot(t_roll, d_roll, lw=2.0, label=f"Rolling mean (w={w})")
-        plt.xlabel("Time (ps)")
-        plt.ylabel("End-to-End Distance (nm)")
-        plt.title(f"E2E vs Time | {meta['end_method_used']}")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
+#     if mode.lower() == "time":
+#         plt.plot(t_plot, d_plot, lw=1.2, label="E2E (nm)")
+#         if rolling_window is not None and rolling_window >= 2 and len(d_plot) >= rolling_window:
+#             w = int(rolling_window)
+#             kernel = np.ones(w) / w
+#             d_roll = np.convolve(d_plot, kernel, mode="valid")
+#             t_roll = t_plot[w-1:]
+#             plt.plot(t_roll, d_roll, lw=2.0, label=f"Rolling mean (w={w})")
+#         plt.xlabel("Time (ps)")
+#         plt.ylabel("End-to-End Distance (nm)")
+#         plt.title(f"E2E vs Time | {meta['end_method_used']}")
+#         plt.grid(True, alpha=0.3)
+#         plt.legend()
 
-    elif mode.lower() == "kde":
-        grid, dens, bw = gaussian_kde_1d(d_plot, bw_method=kde_bw_method, bw=kde_bw)
-        plt.plot(grid, dens, lw=2.0, label=f"KDE (bw={bw:.3g} nm)")
-        plt.xlabel("End-to-End Distance (nm)")
-        plt.ylabel("Density")
-        plt.title(f"E2E KDE | burn_in={burn_in} | downsample={downsample} | {meta['end_method_used']}")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
+#     elif mode.lower() == "kde":
+#         grid, dens, bw = gaussian_kde_1d(d_plot, bw_method=kde_bw_method, bw=kde_bw)
+#         plt.plot(grid, dens, lw=2.0, label=f"KDE (bw={bw:.3g} nm)")
+#         plt.xlabel("End-to-End Distance (nm)")
+#         plt.ylabel("Density")
+#         plt.title(f"E2E KDE | burn_in={burn_in} | downsample={downsample} | {meta['end_method_used']}")
+#         plt.grid(True, alpha=0.3)
+#         plt.legend()
 
-    else:
-        raise ValueError("mode must be 'time' or 'kde'")
+#     else:
+#         raise ValueError("mode must be 'time' or 'kde'")
 
-    plt.tight_layout()
-    if save_plot:
-        os.makedirs(os.path.dirname(save_plot), exist_ok=True)
-        plt.savefig(save_plot, dpi=300)
-    plt.show()
+#     plt.tight_layout()
+#     if save_plot:
+#         os.makedirs(os.path.dirname(save_plot), exist_ok=True)
+#         plt.savefig(save_plot, dpi=300)
+#     plt.show()
 
-    print("end atoms (0-based):", meta["end_atoms_0based"], "| names:", meta["end_atom_names"])
-    print("mean E2E (nm):", meta["mean_nm"], "| std (nm):", meta["std_nm"])
-    print("box (first frame):", meta["box_firstframe"])
+#     print("end atoms (0-based):", meta["end_atoms_0based"], "| names:", meta["end_atom_names"])
+#     print("mean E2E (nm):", meta["mean_nm"], "| std (nm):", meta["std_nm"])
+#     print("box (first frame):", meta["box_firstframe"])
 
-    return t, d, meta
+#     return t, d, meta
 
 def _count_polymer_carbons(poly):
     """
