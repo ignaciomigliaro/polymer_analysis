@@ -6,9 +6,11 @@ import subprocess
 import re
 from pathlib import Path
 from typing import Optional, List
+import shutil
 
 
 def truncate_log(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("")
 
 
@@ -65,7 +67,7 @@ def parse_csv_list(s: str) -> List[str]:
 
 def build_name_prefix_filter(prefixes: List[str]) -> str:
     """
-    Build an atomname prefix filter clause.
+    Build an atomname prefix filter clause (valid in gmx selection language).
     prefixes=["C"] -> ' and name "C*"'
     prefixes=["Cl","CL"] -> ' and (name "Cl*" or name "CL*")'
     prefixes=[] -> '' (no filter)
@@ -80,32 +82,56 @@ def build_name_prefix_filter(prefixes: List[str]) -> str:
     return f" and ({ors})"
 
 
-def run_cmd(cmd: list[str], cwd: Path, dry_run: bool) -> bool:
+def run_gmx(cmd: list[str], cwd: Path, dry_run: bool, log_path: Path, verbose: bool) -> bool:
     if dry_run:
         print("DRY-RUN:", " ".join(cmd), f"(cwd={cwd})")
         return True
 
-    try:
-        subprocess.run(
-            cmd,
-            cwd=cwd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
+    proc = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+
+    if proc.returncode == 0:
         return True
-    except subprocess.CalledProcessError:
-        return False
+
+    # Log full error for debugging
+    with log_path.open("a") as fh:
+        fh.write("\n" + "=" * 80 + "\n")
+        fh.write(f"FAILED in: {cwd}\n")
+        fh.write(f"CMD: {' '.join(cmd)}\n")
+        fh.write("STDOUT:\n" + (proc.stdout or "") + "\n")
+        fh.write("STDERR:\n" + (proc.stderr or "") + "\n")
+
+    if verbose:
+        print(f"\nFAILED in: {cwd}\nCMD: {' '.join(cmd)}\n{proc.stderr}\n")
+
+    return False
+
+
+def rename_ndx_groups(ndx_path: Path, new_names: List[str]) -> None:
+    """
+    Rename the first N group headers in an .ndx file to the provided names.
+    This is safe here because we generate exactly 1 group in poly-only mode,
+    or exactly 2 groups in poly+solvent mode, in a known order.
+    """
+    lines = ndx_path.read_text().splitlines()
+    header_idx = [i for i, ln in enumerate(lines) if ln.strip().startswith("[") and ln.strip().endswith("]")]
+    if len(header_idx) < len(new_names):
+        raise RuntimeError(f"Expected >= {len(new_names)} groups in {ndx_path}, found {len(header_idx)}")
+
+    for j, name in enumerate(new_names):
+        lines[header_idx[j]] = f"[ {name} ]"
+
+    ndx_path.write_text("\n".join(lines) + "\n")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Generate poly_LIG.ndx uniformly across prod dirs using gmx select."
+        description="Generate poly_LIG.ndx uniformly across prod dirs using gmx select (GROMACS 2025.3 compatible)."
     )
     ap.add_argument("--root", default="1-4-DCB", help="Root directory to search")
-    ap.add_argument("--gmx", default="gmx", help="GROMACS command (default: gmx)")
+    ap.add_argument("--gmx", default="gmx", help="GROMACS command (e.g., gmx_mpi)")
     ap.add_argument("--log", default="gmx_select_failed.log", help="Failure log file")
     ap.add_argument("--dry-run", action="store_true", help="Print commands without running")
+    ap.add_argument("--verbose", action="store_true", help="Print gmx stderr on failures")
 
     ap.add_argument(
         "--out",
@@ -113,7 +139,7 @@ def main() -> int:
         help='Output index filename in each prod dir (default: "poly_LIG.ndx")',
     )
 
-    # Atomname prefix knobs (default polymer = carbons)
+    # Atomname prefix knobs
     ap.add_argument(
         "--poly-prefixes",
         default="C",
@@ -125,18 +151,25 @@ def main() -> int:
         help='Comma-separated solvent atomname prefixes (default: "C")',
     )
 
-    # Solvent residue aliases (your 1-4-DCB case)
+    # Solvent residue aliases (1-4-DCB: DCB,PDC; 1-2-DCB likely DCB only)
     ap.add_argument(
         "--solvent-resnames",
         default="DCB,PDC",
         help='Comma-separated solvent residue names (default: "DCB,PDC")',
     )
 
-    # ✅ NEW: polymer-only mode
+    # Polymer-only mode
     ap.add_argument(
         "--poly-only",
         action="store_true",
-        help="Create only POLY_LIG group (no SOLV_DCB group)",
+        help="Create only the polymer group (no solvent group)",
+    )
+
+    # Optional: enforce consistent group names inside the ndx file
+    ap.add_argument(
+        "--rename-groups",
+        action="store_true",
+        help='Rename group headers to [ POLY_LIG ] and [ SOLV_DCB ] inside the .ndx file',
     )
 
     args = ap.parse_args()
@@ -145,17 +178,30 @@ def main() -> int:
     log_path = Path(args.log)
     truncate_log(log_path)
 
+    # Helpful error if gmx executable isn't available
+    if shutil.which(args.gmx) is None:
+        print(
+            f'ERROR: GROMACS executable "{args.gmx}" not found in PATH.\n'
+            f"Try: module load gromacs  (HPC)\n"
+            f"Or pass --gmx gmx_mpi / --gmx /full/path/to/gmx",
+            file=sys.stderr,
+        )
+        return 2
+
     poly_atom_filter = build_name_prefix_filter(parse_csv_list(args.poly_prefixes))
 
-    # Only compute solvent parts if needed
     solv_resnames = parse_csv_list(args.solvent_resnames)
     solv_clause = ""
     solv_atom_filter = ""
     if not args.poly_only:
+        if not solv_resnames:
+            print("ERROR: --solvent-resnames cannot be empty unless --poly-only is set", file=sys.stderr)
+            return 2
         solv_clause = " or ".join([f"resname {r}" for r in solv_resnames])
         solv_clause = f"({solv_clause})"
         solv_atom_filter = build_name_prefix_filter(parse_csv_list(args.solv_prefixes))
 
+    # Iterate over all .../prod directories
     for prod_dir in sorted(p for p in root.rglob("prod") if p.is_dir()):
         gro = prod_dir / "prod.gro"
         tpr = prod_dir / "prod.tpr"
@@ -171,12 +217,15 @@ def main() -> int:
             append_log(log_path, f"NO_POLY_RESNAME {prod_dir}")
             continue
 
+        # ✅ IMPORTANT FIX:
+        # gmx select expects pure selection expressions; group naming is not done via `name "..." ( ... )`.
+        # We pass one or two expressions separated by ';' to create multiple groups.
         if args.poly_only:
-            sel = f'name "POLY_LIG" (resname {poly}{poly_atom_filter})'
+            sel = f"(resname {poly}{poly_atom_filter})"
         else:
             sel = (
-                f'name "POLY_LIG" (resname {poly}{poly_atom_filter}); '
-                f'name "SOLV_DCB" ({solv_clause}{solv_atom_filter})'
+                f"(resname {poly}{poly_atom_filter}); "
+                f"({solv_clause}{solv_atom_filter})"
             )
 
         cmd = [
@@ -187,10 +236,21 @@ def main() -> int:
             "-on", args.out,
         ]
 
-        ok = run_cmd(cmd, cwd=prod_dir, dry_run=args.dry_run)
+        ok = run_gmx(cmd, cwd=prod_dir, dry_run=args.dry_run, log_path=log_path, verbose=args.verbose)
         if not ok:
             append_log(log_path, f"GMX_FAIL {prod_dir} poly={poly}")
             continue
+
+        # Optional: rename group headers inside the index file to consistent names
+        if args.rename_groups and not args.dry_run:
+            try:
+                ndx_path = prod_dir / args.out
+                if args.poly_only:
+                    rename_ndx_groups(ndx_path, ["POLY_LIG"])
+                else:
+                    rename_ndx_groups(ndx_path, ["POLY_LIG", "SOLV_DCB"])
+            except Exception as e:
+                append_log(log_path, f"RENAME_FAIL {prod_dir} err={e}")
 
         tag = "DRY-OK" if args.dry_run else "OK"
         print(f"{tag} {prod_dir} poly={poly}")
@@ -200,4 +260,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    import sys
     raise SystemExit(main())
