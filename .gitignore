@@ -2,3 +2,17 @@ scripts/__pycache__/
 polystat_end_to_end_vs_time.png
 polystat_Rg_and_end_to_end.png
 polystat_Rg_vs_time.png
+superplots/superplot_1-2-DCB_C6.png
+superplots/superplot_1-2-DCB_C20.png
+superplots/superplot_1-2-DCB_C40.png
+superplots/superplot_1-2-DCB_C60.png
+superplots/superplot_1-2-DCB_C80.png
+superplots/superplot_1-2-DCB_C200.png
+superplots/SUPERPLOT_1-2-DCB.png
+superplots/SUPERPLOT_1-4-DCB.png
+superplots/SUPERPLOT_RMDIST_1-4-DCB.png
+scripts/polystat_failures.log
+scripts/gmx_batch_failures.log
+scripts/gmx_rdf_failed.log
+scripts/gmx_select_failed.log
+scripts/poly_only_polystat.out
