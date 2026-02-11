@@ -16,3 +16,4 @@ scripts/gmx_batch_failures.log
 scripts/gmx_rdf_failed.log
 scripts/gmx_select_failed.log
 scripts/poly_only_polystat.out
+superplots/
