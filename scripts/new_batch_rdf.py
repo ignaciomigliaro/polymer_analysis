@@ -74,26 +74,48 @@ def parse_csv_list(s: str) -> List[str]:
 
 
 def run_gmx(cmd: list[str], cwd: Path, dry_run: bool, log_path: Path, verbose: bool) -> bool:
-    if dry_run:
-        print("DRY-RUN:", " ".join(cmd), f"(cwd={cwd})")
-        return True
+    try:
+        if dry_run:
+            print("DRY-RUN:", " ".join(cmd), f"(cwd={cwd})")
+            return True
 
-    proc = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,   # <-- do NOT raise on nonzero return
+        )
 
-    if proc.returncode == 0:
-        return True
+        if proc.returncode == 0:
+            return True
 
-    with log_path.open("a") as fh:
-        fh.write("\n" + "=" * 80 + "\n")
-        fh.write(f"FAILED in: {cwd}\n")
-        fh.write(f"CMD: {' '.join(cmd)}\n")
-        fh.write("STDOUT:\n" + (proc.stdout or "") + "\n")
-        fh.write("STDERR:\n" + (proc.stderr or "") + "\n")
+        # Command ran but failed
+        with log_path.open("a") as fh:
+            fh.write("\n" + "=" * 80 + "\n")
+            fh.write(f"FAILED (nonzero exit) in: {cwd}\n")
+            fh.write(f"CMD: {' '.join(cmd)}\n")
+            fh.write("STDOUT:\n" + (proc.stdout or "") + "\n")
+            fh.write("STDERR:\n" + (proc.stderr or "") + "\n")
 
-    if verbose:
-        print(f"\nFAILED in: {cwd}\nCMD: {' '.join(cmd)}\n{proc.stderr}\n")
+        if verbose:
+            print(f"\nFAILED in: {cwd}\nCMD: {' '.join(cmd)}\n{proc.stderr}\n")
 
-    return False
+        return False
+
+    except Exception as e:
+        # Something unexpected happened (IO error, OS error, etc.)
+        with log_path.open("a") as fh:
+            fh.write("\n" + "=" * 80 + "\n")
+            fh.write(f"EXCEPTION in: {cwd}\n")
+            fh.write(f"CMD: {' '.join(cmd)}\n")
+            fh.write(f"ERROR: {repr(e)}\n")
+
+        if verbose:
+            print(f"\nEXCEPTION in {cwd}: {e}\n")
+
+        return False
+
 
 
 def _infer_tag_from_path(prod_dir: Path) -> str:
