@@ -60,7 +60,7 @@ def infer_polymer_resname(gro: Path, prod_dir: Path) -> Optional[str]:
     if gro_contains_resname(gro, "LIG"):
         return "LIG"
 
-    m = re.search(r"/(C\d+)/", str(prod_dir))
+    m = re.search(r"/(C\d+)/", str(prod_dir).replace("\\", "/"))
     if m:
         cname = m.group(1)
         if gro_contains_resname(gro, cname):
@@ -98,18 +98,14 @@ def run_gmx(cmd: list[str], cwd: Path, dry_run: bool, log_path: Path, verbose: b
 
 def _infer_tag_from_path(prod_dir: Path) -> str:
     """
-    Make a unique tag from the directory structure.
     Typical:
       .../<solvent>/<C20>/<10>/run2/prod
     Returns:
-      "C20_10_run2" (and includes solvent if present: "1-4-DCB_C20_10_run2")
+      "1-4-DCB_C20_10_run2" or "C20_10_run2"
     """
     p = str(prod_dir).replace("\\", "/")
 
-    # Solvent folder often is "1-2-DCB" or "1-4-DCB" right above Cxx,
-    # but we’ll just grab the last solvent-like token if present.
     solv = None
-    # common pattern includes "-DCB"
     msolv = re.search(r"/([^/]*DCB[^/]*)/C\d+/", p)
     if msolv:
         solv = msolv.group(1)
@@ -131,8 +127,22 @@ def _infer_tag_from_path(prod_dir: Path) -> str:
     if parts:
         return "_".join(parts)
 
-    # fallback: unique but filesystem-safe-ish
     return prod_dir.as_posix().strip("/").replace("/", "_")
+
+
+def build_sel_from_prefixes(resname: str, prefixes: list[str]) -> str:
+    """
+    Build a GROMACS selection:
+      - no prefixes:  resname X
+      - one:          resname X and name "C*"
+      - many:         resname X and (name "C*" or name "H*")
+    """
+    if len(prefixes) == 0:
+        return f"resname {resname}"
+    if len(prefixes) == 1:
+        return f'resname {resname} and name "{prefixes[0]}*"'
+    ors = " or ".join([f'name "{p}*"' for p in prefixes])
+    return f"resname {resname} and ({ors})"
 
 
 def main() -> int:
@@ -144,10 +154,18 @@ def main() -> int:
     ap.add_argument("--log", default="gmx_rdf_failed.log", help="Failure log file")
     ap.add_argument("--dry-run", action="store_true", help="Print commands without running")
     ap.add_argument("--verbose", action="store_true", help="Print gmx stderr on failures")
-    
+
     # selections
     ap.add_argument("--poly-prefixes", default="C", help='Comma-separated polymer atomname prefixes (default: "C")')
     ap.add_argument("--solvent-resnames", default="DCB,PDC", help='Comma-separated solvent residue names (default: "DCB,PDC")')
+
+    # NEW: restrict which solvent atoms are used in -sel (empty => use whole solvent resname)
+    ap.add_argument(
+        "--solvent-prefixes",
+        default="",
+        help='Comma-separated solvent atomname prefixes to include in -sel (default: "" = all solvent atoms). '
+             'Example: --solvent-prefixes C (only solvent atoms with names starting with C).'
+    )
 
     # rdf knobs
     ap.add_argument("--seltype", default="mol_com", choices=[
@@ -164,23 +182,21 @@ def main() -> int:
     ], help="Selection reference positions (default: atom)")
     ap.add_argument("--bin", type=float, default=0.1, help="RDF bin width (default: 0.1)")
     ap.add_argument(
-    "--begin",
-    type=float,
-    default=30.0,
-    help="First frame time (ps) to read from trajectory (passed to gmx rdf as -b). Default: 0",
-)
+        "--begin",
+        type=float,
+        default=30.0,
+        help="First frame time (ps) to read from trajectory (passed to gmx rdf as -b). Default: 30.0",
+    )
 
-    # outputs (we will append a tag)
+    # outputs
     ap.add_argument("--out-rdf", default='rdf_Cpoly_{solv}molCOM_{tag}.xvg',
                     help='Output RDF filename template (default: rdf_Cpoly_{solv}molCOM_{tag}.xvg)')
     ap.add_argument("--out-cn", default='cn_Cpoly_{solv}molCOM_{tag}.xvg',
                     help='Output CN filename template (default: cn_Cpoly_{solv}molCOM_{tag}.xvg)')
 
-    # optional: if you still want to use an ndx file (not required when using -ref/-sel selections)
     ap.add_argument("--ndx", default=None,
-                    help='Optional index file (e.g., poly_LIG_COM_DCB.ndx). If provided, passed with -n.')
+                    help='Optional index file. If provided, passed with -n.')
 
-    # behavior if output exists
     ap.add_argument("--skip-existing", action="store_true",
                     help="If output file already exists, skip running RDF in that directory.")
 
@@ -199,13 +215,14 @@ def main() -> int:
         )
         return 2
 
-    prefixes = parse_csv_list(args.poly_prefixes)
+    poly_prefixes = parse_csv_list(args.poly_prefixes)
     solv_resnames = parse_csv_list(args.solvent_resnames)
+    solv_prefixes = parse_csv_list(args.solvent_prefixes)
+
     if not solv_resnames:
         print("ERROR: --solvent-resnames cannot be empty", file=sys.stderr)
         return 2
 
-    # Iterate over all .../prod directories
     for prod_dir in sorted(p for p in root.rglob("prod") if p.is_dir()):
         gro = prod_dir / "prod.gro"
         tpr = prod_dir / "prod.tpr"
@@ -228,15 +245,8 @@ def main() -> int:
             continue
 
         # --- Selection strings ---
-        if len(prefixes) == 0:
-            ref_sel = f"resname {poly}"
-        elif len(prefixes) == 1:
-            ref_sel = f'resname {poly} and name "{prefixes[0]}*"'
-        else:
-            ors = " or ".join([f'name "{p}*"' for p in prefixes])
-            ref_sel = f"resname {poly} and ({ors})"
-
-        sel = f"resname {solv}"
+        ref_sel = build_sel_from_prefixes(poly, poly_prefixes)
+        sel = build_sel_from_prefixes(solv, solv_prefixes)  # NEW
 
         tag = _infer_tag_from_path(prod_dir)
 
