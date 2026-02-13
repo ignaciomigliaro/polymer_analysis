@@ -396,18 +396,36 @@ def plot_superplot_simple(
 # RDF superplot (your functional code, wrapped)
 # ============================================================
 
-def rdf_path_resolve(base: Path, solvent: str, carbon: int, func: int, run: int) -> Path | None:
+
+def rdf_path_resolve(
+    base: Path,
+    solvent: str,
+    carbon: int,
+    func: int,
+    run: int,
+    *,
+    static_name: str | None = None,
+) -> Path | None:
     prod = base / f"C{carbon}" / str(func) / f"run{run}" / "prod"
 
-    candidates = [
+    candidates: list[Path] = []
+
+    # 1) Static first (if provided)
+    if static_name:
+        candidates.append(prod / static_name)
+
+    # 2) Dynamic fallback
+    candidates.extend([
         prod / f"rdf_Cpoly_PDCmolCOM_{solvent}_C{carbon}_{func}_run{run}.xvg",
         prod / f"rdf_Cpoly_DCBmolCOM_{solvent}_C{carbon}_{func}_run{run}.xvg",
-    ]
+    ])
 
     for p in candidates:
         if p.exists():
             return p
     return None
+
+
 
 
 def load_runs_rdf(
@@ -417,6 +435,7 @@ def load_runs_rdf(
     func: int,
     runs: list[int],
     *,
+    static_name: str | None = None,
     quiet_missing: bool = False,
     verbose: bool = True,
 ) -> tuple[np.ndarray | None, list[np.ndarray]]:
@@ -424,12 +443,15 @@ def load_runs_rdf(
     ys: list[np.ndarray] = []
 
     for run in runs:
-        p = rdf_path_resolve(base, solvent, carbon, func, run)
+        p = rdf_path_resolve(base, solvent, carbon, func, run, static_name=static_name)
 
         if p is None:
             if not quiet_missing and verbose:
                 prod = base / f"C{carbon}" / str(func) / f"run{run}" / "prod"
-                print(f"[MISS] no PDC/DCB RDF in {prod}")
+                print(f"[MISS] no RDF in {prod}")
+            if static_name:
+                msg += f" (also tried static_name={static_name})"
+            print(msg)
             continue
 
         x, y = parse_xvg(p)
@@ -437,7 +459,6 @@ def load_runs_rdf(
         if x_ref is None:
             x_ref = x
         else:
-            # keep your original tolerance
             if len(x) != len(x_ref) or not np.allclose(x, x_ref, rtol=0, atol=5):
                 if verbose:
                     print(f"[SKIP] x-grid mismatch: {p}")
@@ -446,6 +467,7 @@ def load_runs_rdf(
         ys.append(y)
 
     return x_ref, ys
+
 
 def plot_superplot_rmsdist(base: Path, **kwargs):
     return plot_superplot_simple(
@@ -456,6 +478,514 @@ def plot_superplot_rmsdist(base: Path, **kwargs):
         **kwargs,
     )
 
+from pathlib import Path
+import numpy as np
+import re
+
+
+def compute_overall_mean_std_across_runs(
+    base: Path,
+    *,
+    filename: str,
+    carbon: int | list[int],
+    func: int | list[int],
+    runs: list[int],
+    tmin: float | None = None,   # only use data with x >= tmin
+    tmax: float | None = None,   # only use data with x <= tmax
+    verbose: bool = True,
+    # NEW: robustness knobs
+    drop_nonfinite: bool = True,          # drop NaN/Inf before averaging
+    min_points: int = 1,                  # minimum points required after filtering (and dropping NaN/Inf)
+    report_nonfinite: bool = True,        # print how many NaN/Inf were dropped per run
+):
+    """
+    Compute ONE scalar per run (time-average), then mean/std across runs.
+
+    Returns
+    -------
+    results : dict
+        results[(carbon, func)] = {
+            "run_means": {run: mean_value_for_that_run, ...},
+            "mean": overall_mean_across_runs,
+            "std":  std_across_runs (ddof=1, 0 if only 1 run),
+            "n":    number_of_runs_used
+        }
+
+    Notes
+    -----
+    - If your .xvg contains NaNs (common in polystat outputs), np.mean(...) becomes NaN.
+      Setting drop_nonfinite=True (default) makes the function ignore those frames and still
+      compute a valid mean when possible.
+    """
+    carbons = carbon if isinstance(carbon, (list, tuple)) else [carbon]
+    funcs = func if isinstance(func, (list, tuple)) else [func]
+
+    def parse_xvg(path: Path) -> tuple[np.ndarray, np.ndarray]:
+        xs, ys = [], []
+        with path.open("r", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line[0] in ("#", "@"):
+                    continue
+                parts = re.split(r"\s+", line)
+                if len(parts) < 2:
+                    continue
+                try:
+                    xs.append(float(parts[0]))
+                    ys.append(float(parts[1]))
+                except ValueError:
+                    continue
+        return np.asarray(xs, float), np.asarray(ys, float)
+
+    results: dict[tuple[int, int], dict] = {}
+
+    for c in carbons:
+        for f in funcs:
+            run_means: dict[int, float] = {}
+
+            for run in runs:
+                p = base / f"C{c}" / str(f) / f"run{run}" / "prod" / filename
+                if not p.exists():
+                    if verbose:
+                        print(f"[MISS] {p}")
+                    continue
+
+                x, y = parse_xvg(p)
+
+                # time/window mask
+                mask = np.ones_like(x, dtype=bool)
+                if tmin is not None:
+                    mask &= (x >= tmin)
+                if tmax is not None:
+                    mask &= (x <= tmax)
+
+                ysel = y[mask]
+
+                if ysel.size == 0:
+                    if verbose:
+                        print(f"[SKIP] no data after filtering: {p}")
+                    continue
+
+                # drop NaN/Inf (common in persist/polystat outputs)
+                if drop_nonfinite:
+                    finite = np.isfinite(ysel)
+                    n_bad = int((~finite).sum())
+                    if report_nonfinite and verbose and n_bad > 0:
+                        print(f"[WARN] dropped {n_bad} NaN/Inf points: {p}")
+                    ysel = ysel[finite]
+
+                if ysel.size < min_points:
+                    if verbose:
+                        print(f"[SKIP] insufficient valid points (n={ysel.size}): {p}")
+                    continue
+
+                # robust mean
+                run_means[run] = float(ysel.mean())
+
+            if len(run_means) == 0:
+                if verbose:
+                    print(f"[WARN] No valid runs for C{c}, func={f}")
+                continue
+
+            vals = np.array(list(run_means.values()), dtype=float)
+
+            # (vals should be finite, but guard anyway)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                if verbose:
+                    print(f"[WARN] All run means non-finite for C{c}, func={f}")
+                continue
+
+            overall_mean = float(vals.mean())
+            overall_std = float(vals.std(ddof=1)) if vals.size > 1 else 0.0
+
+            results[(c, f)] = {
+                "run_means": run_means,
+                "mean": overall_mean,
+                "std": overall_std,
+                "n": int(vals.size),
+            }
+
+    return results
+
+
+
+
+
+def plot_property_vs_chainlength_by_func(
+    *,
+    base_root: Path,
+    solvents: list[str],
+    filename: str,
+    carbons: list[int],
+    funcs: list[int],
+    runs: list[int],
+    # NEW: for polystat.xvg choose which series to use
+    polystat_metric: str | None = None,   # "rg" or "end-to-end" when filename=="polystat.xvg"
+    tmin: float | None = None,
+    tmax: float | None = None,
+    drop_nonfinite: bool = True,
+    min_points: int = 1,
+    ncols: int = 3,
+    show_errorbars: bool = True,
+    outpath: Path | None = None,
+    dpi: int = 300,
+    verbose: bool = True,
+):
+    """
+    Superplot:
+      x = carbon chain length
+      y = time-averaged property (mean across runs)
+      panels = functionalization levels
+      lines = solvents (e.g. 1-2-DCB vs 1-4-DCB)
+
+    Directory structure:
+      base_root/<solvent>/C{carbon}/{func}/run{run}/prod/<filename>
+
+    Supports single-series XVG files (persist.xvg, intdist.xvg, rmsdist.xvg, etc.)
+    and polystat.xvg (multi-series) via polystat_metric="rg" or "end-to-end".
+    """
+
+    base_root = Path(base_root)
+
+    # --- parser for both single- and multi-series polystat-style files ---
+    def parse_polystat_xvg(path: Path):
+        lines = path.read_text(errors="replace").splitlines()
+
+        legends = {}
+        for ln in lines:
+            m = re.match(r'@\s+s(\d+)\s+legend\s+"(.*)"', ln)
+            if m:
+                legends[int(m.group(1))] = m.group(2)
+
+        rows = []
+        for ln in lines:
+            if not ln or ln[0] in ("#", "@"):
+                continue
+            parts = ln.split()
+            try:
+                rows.append([float(x) for x in parts])
+            except ValueError:
+                continue
+
+        arr = np.asarray(rows, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            raise ValueError(f"No numeric XY data found in {path}")
+
+        x = arr[:, 0]
+        ycols = arr[:, 1:]
+
+        ys = {}
+        for i in range(ycols.shape[1]):
+            legend = legends.get(i, f"y{i}")
+            ys[legend] = ycols[:, i]
+        return x, ys
+
+    def parse_simple_xvg(path: Path):
+        xs, ys = [], []
+        with path.open("r", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line[0] in ("#", "@"):
+                    continue
+                parts = re.split(r"\s+", line)
+                if len(parts) < 2:
+                    continue
+                try:
+                    xs.append(float(parts[0]))
+                    ys.append(float(parts[1]))
+                except ValueError:
+                    continue
+        return np.asarray(xs, float), np.asarray(ys, float)
+
+    # --- choose series from polystat.xvg ---
+    def pick_polystat_series(ys: dict[str, np.ndarray], metric: str) -> tuple[str, np.ndarray]:
+        m = metric.strip().lower().replace("_", "-")
+
+        items = [(k, k.lower()) for k in ys.keys()]
+
+        def pick(pred):
+            for k, kl in items:
+                if pred(kl):
+                    return k
+            return None
+
+        if m in ("rg", "gyr", "gyration", "radius-of-gyration"):
+            # Prefer the non-eigen Rg: <R\sg\N> without "eig"
+            key = pick(lambda s: ("r\\sg\\n" in s) and ("eig" not in s))
+            if key is None:
+                key = pick(lambda s: ("gyr" in s) or ("radius" in s) or ("rg" in s) or ("r\\sg\\n" in s))
+            if key is None:
+                raise KeyError(f"No Rg-like legend found. Available: {list(ys.keys())}")
+            return key, ys[key]
+
+        if m in ("end-to-end", "end2end", "endtoend", "ete"):
+            key = pick(lambda s: ("end" in s) and ("eig" not in s))
+            if key is None:
+                raise KeyError(f"No end-to-end-like legend found. Available: {list(ys.keys())}")
+            return key, ys[key]
+
+        raise ValueError("polystat_metric must be 'rg' or 'end-to-end'")
+
+    # --- validate polystat request ---
+    is_polystat = (Path(filename).name == "polystat.xvg")
+    if is_polystat and not polystat_metric:
+        raise ValueError("When filename='polystat.xvg', you must set polystat_metric='rg' or 'end-to-end'")
+
+    # --- compute per-(solvent, carbon, func) mean±std across runs ---
+    def overall_mean_std_for_combo(
+        base_solvent: Path,
+        *,
+        carbon: int,
+        func: int,
+        filename: str,
+        runs: list[int],
+    ) -> tuple[float, float, int]:
+        run_means = []
+
+        for run in runs:
+            p = base_solvent / f"C{carbon}" / str(func) / f"run{run}" / "prod" / filename
+
+            if not p.exists():
+                if verbose:
+                    print(f"[MISS] {p}")
+                continue
+
+            if Path(filename).name == "polystat.xvg":
+                x, ys_map = parse_polystat_xvg(p)
+                _, y = pick_polystat_series(ys_map, polystat_metric)  # type: ignore[arg-type]
+            else:
+                x, y = parse_simple_xvg(p)
+
+            mask = np.ones_like(x, dtype=bool)
+            if tmin is not None:
+                mask &= (x >= tmin)
+            if tmax is not None:
+                mask &= (x <= tmax)
+
+            ysel = y[mask]
+
+            if drop_nonfinite:
+                ysel = ysel[np.isfinite(ysel)]
+
+            if ysel.size < min_points:
+                continue
+
+            run_means.append(float(ysel.mean()))
+
+        if len(run_means) == 0:
+            return np.nan, np.nan, 0
+
+        vals = np.asarray(run_means, float)
+        mean = float(np.nanmean(vals))
+        std = float(np.nanstd(vals, ddof=1)) if np.isfinite(vals).sum() > 1 else 0.0
+        n = int(np.isfinite(vals).sum())
+        return mean, std, n
+
+    # ---- figure layout ----
+    n_panels = len(funcs)
+    ncols_use = min(ncols, n_panels)
+    nrows = math.ceil(n_panels / ncols_use)
+
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols_use,
+        figsize=(5.2 * ncols_use, 3.8 * nrows),
+        sharex=True,
+        sharey=False,
+    )
+    axes = np.atleast_1d(axes).ravel()
+
+    # ylabel label
+    ylab = filename
+    if is_polystat:
+        ylab = f"polystat: {polystat_metric}"
+
+    # ---- plot ----
+    for i, func in enumerate(funcs):
+        ax = axes[i]
+        plotted = False
+
+        for solvent in solvents:
+            base_solvent = base_root / solvent
+
+            xs, means, stds = [], [], []
+
+            for carbon in carbons:
+                mean, std, n = overall_mean_std_for_combo(
+                    base_solvent,
+                    carbon=carbon,
+                    func=func,
+                    filename=filename,
+                    runs=runs,
+                )
+                xs.append(carbon)
+                means.append(mean)
+                stds.append(std)
+
+            xs = np.asarray(xs, int)
+            means = np.asarray(means, float)
+            stds = np.asarray(stds, float)
+
+            ok = np.isfinite(means)
+            if not ok.any():
+                continue
+
+            if show_errorbars:
+                ax.errorbar(
+                    xs[ok],
+                    means[ok],
+                    yerr=stds[ok],
+                    marker="o",
+                    linewidth=2,
+                    capsize=3,
+                    label=solvent,
+                )
+            else:
+                ax.plot(
+                    xs[ok],
+                    means[ok],
+                    marker="o",
+                    linewidth=2,
+                    label=solvent,
+                )
+
+            plotted = True
+
+        ax.set_title(f"{func}% functionalization")
+        ax.set_xlabel("Carbon chain length")
+        ax.set_ylabel(f"⟨{ylab}⟩")
+
+        ax.grid(alpha=0.25)
+        if plotted:
+            ax.legend(frameon=False, fontsize=9)
+        else:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+
+    for j in range(n_panels, len(axes)):
+        axes[j].axis("off")
+
+    window = ""
+    if tmin is not None or tmax is not None:
+        window = f" (window: {tmin if tmin is not None else '-inf'} to {tmax if tmax is not None else 'inf'})"
+
+    fig.suptitle(
+        f"Property vs Chain Length — {ylab}{window}",
+        y=1.02,
+        fontsize=14,
+    )
+    fig.tight_layout()
+
+    if outpath is not None:
+        outpath = Path(outpath)
+        outpath.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(outpath, dpi=dpi, bbox_inches="tight")
+        if verbose:
+            print(f"[OK] Saved {outpath}")
+
+    return fig, axes
+
+
+    
+def compute_mean_std_across_runs(
+    base: Path,
+    *,
+    filename: str,
+    carbon: int | list[int],
+    func: int | list[int],
+    runs: list[int],
+    atol_grid: float = 1e-6,
+    verbose: bool = True,
+):
+    """
+    Compute mean/std across runs for multiple carbons and funcs.
+
+    Returns
+    -------
+    results : dict
+        results[(carbon, func)] = {
+            "x": x_array,
+            "mean": mean_array,
+            "std": std_array,
+            "n": number_of_runs_used
+        }
+    """
+
+    # normalize inputs to lists
+    carbons = carbon if isinstance(carbon, (list, tuple)) else [carbon]
+    funcs = func if isinstance(func, (list, tuple)) else [func]
+
+    def parse_xvg(path):
+        xs, ys = [], []
+        with path.open("r", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line[0] in ("#", "@"):
+                    continue
+                parts = re.split(r"\s+", line)
+                if len(parts) < 2:
+                    continue
+                try:
+                    xs.append(float(parts[0]))
+                    ys.append(float(parts[1]))
+                except ValueError:
+                    continue
+        return np.asarray(xs), np.asarray(ys)
+
+    results = {}
+
+    for c in carbons:
+        for f in funcs:
+
+            x_ref = None
+            ys = []
+
+            for run in runs:
+                p = (
+                    base
+                    / f"C{c}"
+                    / str(f)
+                    / f"run{run}"
+                    / "prod"
+                    / filename
+                )
+
+                if not p.exists():
+                    if verbose:
+                        print(f"[MISS] {p}")
+                    continue
+
+                x, y = parse_xvg(p)
+
+                if x_ref is None:
+                    x_ref = x
+                else:
+                    if len(x) != len(x_ref) or not np.allclose(x, x_ref, atol=atol_grid):
+                        if verbose:
+                            print(f"[SKIP] grid mismatch: {p}")
+                        continue
+
+                ys.append(y)
+
+            if len(ys) == 0:
+                if verbose:
+                    print(f"[WARN] No valid runs for C{c}, func={f}")
+                continue
+
+            Y = np.vstack(ys)
+            mean_y = Y.mean(axis=0)
+            std_y = Y.std(axis=0, ddof=1) if Y.shape[0] > 1 else np.zeros_like(mean_y)
+
+            results[(c, f)] = {
+                "x": x_ref,
+                "mean": mean_y,
+                "std": std_y,
+                "n": len(ys),
+            }
+
+    return results
+
+
 
 def plot_superplot_rdf(
     base: Path,
@@ -464,6 +994,7 @@ def plot_superplot_rdf(
     carbons: list[int],
     funcs: list[int],
     runs: list[int],
+    static_name: str | None = None,
     outpath: Path | None = None,
     ncols: int = 3,
     thin_runs: bool = True,
@@ -493,7 +1024,14 @@ def plot_superplot_rdf(
 
         for func in funcs_use:
             x_ref, ys = load_runs_rdf(
-                base, solvent, carbon, func, runs, quiet_missing=quiet_missing, verbose=verbose
+                base, 
+                solvent, 
+                carbon, 
+                func, 
+                runs,
+                static_name=static_name, 
+                quiet_missing=quiet_missing, 
+                verbose=verbose
             )
             if x_ref is None or len(ys) == 0:
                 continue
@@ -548,7 +1086,7 @@ def superplot_polystat_by_carbon(
     outpath: Path | None = None,
     dpi: int = 300,
     verbose: bool = True,
-    atol_grid: float = 1e-6,
+    atol_grid: float = 1e-1,
     # NEW: choose ONE visualization mode
     mode: str = "time",                 # "time" or "kde"
     kde_mode: str = "mean",             # used only if mode="kde": "mean" or "runs"
