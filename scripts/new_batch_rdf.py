@@ -180,7 +180,7 @@ def main() -> int:
     # selections
     ap.add_argument("--poly-prefixes", default="C", help='Comma-separated polymer atomname prefixes (default: "C")')
     ap.add_argument("--solvent-resnames", default="DCB,PDC", help='Comma-separated solvent residue names (default: "DCB,PDC")')
-
+   
     # NEW: restrict which solvent atoms are used in -sel (empty => use whole solvent resname)
     ap.add_argument(
         "--solvent-prefixes",
@@ -208,6 +208,18 @@ def main() -> int:
         type=float,
         default=30.0,
         help="First frame time (ps) to read from trajectory (passed to gmx rdf as -b). Default: 30.0",
+    )
+    ap.add_argument(
+        "--cut",
+        type=float,
+        default=0.0,
+        help="Shortest distance (nm) to be considered (passed to gmx rdf as -cut). 0 disables.",
+    )
+    ap.add_argument(
+        "--rmax",
+        type=float,
+        default=4.0,
+        help="Largest distance (nm) to calculate (passed to gmx rdf as -rmax). 0 uses gmx default.",
     )
 
     # outputs
@@ -292,6 +304,11 @@ def main() -> int:
             "-cn", out_cn.name,
             "-b", str(args.begin),
         ]
+                # Optional distance range controls
+        if args.cut and args.cut > 0:
+            cmd += ["-cut", str(args.cut)]
+        if args.rmax and args.rmax > 0:
+            cmd += ["-rmax", str(args.rmax)]
 
         if args.ndx:
             ndx_path = prod_dir / args.ndx
