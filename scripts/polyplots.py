@@ -104,8 +104,6 @@ def parse_polystat_xvg(path):
 
     return x, ys
 
-
-
 def index_prod_property(
     base: Path,
     filename: str,
@@ -425,9 +423,6 @@ def rdf_path_resolve(
             return p
     return None
 
-
-
-
 def load_runs_rdf(
     base: Path,
     solvent: str,
@@ -468,7 +463,6 @@ def load_runs_rdf(
 
     return x_ref, ys
 
-
 def plot_superplot_rmsdist(base: Path, **kwargs):
     return plot_superplot_simple(
         base,
@@ -477,11 +471,6 @@ def plot_superplot_rmsdist(base: Path, **kwargs):
         ylabel="rmsdist",
         **kwargs,
     )
-
-from pathlib import Path
-import numpy as np
-import re
-
 
 def compute_overall_mean_std_across_runs(
     base: Path,
@@ -607,10 +596,6 @@ def compute_overall_mean_std_across_runs(
             }
 
     return results
-
-
-
-
 
 def plot_property_vs_chainlength_by_func(
     *,
@@ -885,8 +870,6 @@ def plot_property_vs_chainlength_by_func(
 
     return fig, axes
 
-
-    
 def compute_mean_std_across_runs(
     base: Path,
     *,
@@ -984,8 +967,6 @@ def compute_mean_std_across_runs(
             }
 
     return results
-
-
 
 def plot_superplot_rdf(
     base: Path,
@@ -1370,6 +1351,245 @@ def superplot_polystat_by_carbon(
     title_solvent = f" — {solvent}" if solvent else ""
     fig.suptitle(
         f"{metric.upper()} Superplot{title_solvent} ({mode})",
+        y=1.02,
+        fontsize=14,
+    )
+    fig.tight_layout()
+
+    if outpath is not None:
+        outpath = Path(outpath)
+        outpath.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(outpath, dpi=dpi, bbox_inches="tight")
+        if verbose:
+            print(f"[OK] Saved {outpath}")
+
+    return fig, axes
+
+
+def plot_property_std_vs_chainlength_by_func(
+    *,
+    base_root: Path,
+    solvents: list[str],
+    filename: str,
+    carbons: list[int],
+    funcs: list[int],
+    runs: list[int],
+    polystat_metric: str | None = None,   # required if filename=="polystat.xvg"
+    tmin: float | None = None,
+    tmax: float | None = None,
+    drop_nonfinite: bool = True,
+    min_points: int = 1,
+    ncols: int = 3,
+    outpath: Path | None = None,
+    dpi: int = 300,
+    verbose: bool = True,
+):
+    """
+    Superplot:
+      x = carbon chain length
+      y = std across runs of the *time-averaged* property
+      panels = functionalization levels
+      lines = solvents
+
+    Directory structure:
+      base_root/<solvent>/C{carbon}/{func}/run{run}/prod/<filename>
+
+    For each run:
+      - compute a time-average (optionally within [tmin,tmax], dropping NaN/Inf)
+    For each (solvent, carbon, func):
+      - compute std across those run-averages (run-to-run variability)
+    """
+
+    base_root = Path(base_root)
+
+    # ---- parsers ----
+    def parse_polystat_xvg(path: Path):
+        lines = path.read_text(errors="replace").splitlines()
+
+        legends = {}
+        for ln in lines:
+            m = re.match(r'@\s+s(\d+)\s+legend\s+"(.*)"', ln)
+            if m:
+                legends[int(m.group(1))] = m.group(2)
+
+        rows = []
+        for ln in lines:
+            if not ln or ln[0] in ("#", "@"):
+                continue
+            parts = ln.split()
+            try:
+                rows.append([float(x) for x in parts])
+            except ValueError:
+                continue
+
+        arr = np.asarray(rows, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            raise ValueError(f"No numeric XY data found in {path}")
+
+        x = arr[:, 0]
+        ycols = arr[:, 1:]
+
+        ys = {}
+        for i in range(ycols.shape[1]):
+            legend = legends.get(i, f"y{i}")
+            ys[legend] = ycols[:, i]
+
+        return x, ys
+
+    def parse_simple_xvg(path: Path):
+        xs, ys = [], []
+        with path.open("r", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line[0] in ("#", "@"):
+                    continue
+                parts = re.split(r"\s+", line)
+                if len(parts) < 2:
+                    continue
+                try:
+                    xs.append(float(parts[0]))
+                    ys.append(float(parts[1]))
+                except ValueError:
+                    continue
+        return np.asarray(xs, float), np.asarray(ys, float)
+
+    def pick_polystat_series(ys: dict[str, np.ndarray], metric: str) -> tuple[str, np.ndarray]:
+        m = metric.strip().lower().replace("_", "-")
+        items = [(k, k.lower()) for k in ys.keys()]
+
+        def pick(pred):
+            for k, kl in items:
+                if pred(kl):
+                    return k
+            return None
+
+        if m in ("rg", "gyr", "gyration", "radius-of-gyration"):
+            key = pick(lambda s: ("r\\sg\\n" in s) and ("eig" not in s))
+            if key is None:
+                key = pick(lambda s: ("gyr" in s) or ("radius" in s) or ("rg" in s) or ("r\\sg\\n" in s))
+            if key is None:
+                raise KeyError(f"No Rg-like legend found. Available: {list(ys.keys())}")
+            return key, ys[key]
+
+        if m in ("end-to-end", "end2end", "endtoend", "ete"):
+            key = pick(lambda s: ("end" in s) and ("eig" not in s))
+            if key is None:
+                raise KeyError(f"No end-to-end-like legend found. Available: {list(ys.keys())}")
+            return key, ys[key]
+
+        raise ValueError("polystat_metric must be 'rg' or 'end-to-end'")
+
+    is_polystat = (Path(filename).name == "polystat.xvg")
+    if is_polystat and not polystat_metric:
+        raise ValueError("When filename='polystat.xvg', set polystat_metric='rg' or 'end-to-end'")
+
+    # ---- compute std across runs for each point ----
+    def run_to_run_std_for_combo(
+        base_solvent: Path,
+        *,
+        carbon: int,
+        func: int,
+    ) -> tuple[float, int]:
+        run_means = []
+
+        for run in runs:
+            p = base_solvent / f"C{carbon}" / str(func) / f"run{run}" / "prod" / filename
+            if not p.exists():
+                if verbose:
+                    print(f"[MISS] {p}")
+                continue
+
+            if is_polystat:
+                x, ys_map = parse_polystat_xvg(p)
+                _, y = pick_polystat_series(ys_map, polystat_metric)  # type: ignore[arg-type]
+            else:
+                x, y = parse_simple_xvg(p)
+
+            mask = np.ones_like(x, dtype=bool)
+            if tmin is not None:
+                mask &= (x >= tmin)
+            if tmax is not None:
+                mask &= (x <= tmax)
+
+            ysel = y[mask]
+            if drop_nonfinite:
+                ysel = ysel[np.isfinite(ysel)]
+
+            if ysel.size < min_points:
+                continue
+
+            run_means.append(float(ysel.mean()))
+
+        if len(run_means) == 0:
+            return np.nan, 0
+
+        vals = np.asarray(run_means, float)
+        n = int(np.isfinite(vals).sum())
+        std = float(np.nanstd(vals, ddof=1)) if n > 1 else 0.0
+        return std, n
+
+    # ---- figure layout ----
+    n_panels = len(funcs)
+    ncols_use = min(ncols, n_panels)
+    nrows = math.ceil(n_panels / ncols_use)
+
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols_use,
+        figsize=(5.2 * ncols_use, 3.8 * nrows),
+        sharex=True,
+        sharey=False,
+    )
+    axes = np.atleast_1d(axes).ravel()
+
+    ylab = filename if not is_polystat else f"polystat: {polystat_metric}"
+
+    for i, func in enumerate(funcs):
+        ax = axes[i]
+        plotted = False
+
+        for solvent in solvents:
+            base_solvent = base_root / solvent
+
+            xs = []
+            stds = []
+            ns = []
+
+            for carbon in carbons:
+                s, n = run_to_run_std_for_combo(base_solvent, carbon=carbon, func=func)
+                xs.append(carbon)
+                stds.append(s)
+                ns.append(n)
+
+            xs = np.asarray(xs, int)
+            stds = np.asarray(stds, float)
+
+            ok = np.isfinite(stds)
+            if not ok.any():
+                continue
+
+            ax.plot(xs[ok], stds[ok], marker="o", linewidth=2, label=solvent)
+            plotted = True
+
+        ax.set_title(f"{func}% functionalization")
+        ax.set_xlabel("Carbon chain length")
+        ax.set_ylabel(f"std across runs of ⟨{ylab}⟩")
+
+        ax.grid(alpha=0.25)
+        if plotted:
+            ax.legend(frameon=False, fontsize=9)
+        else:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+
+    for j in range(n_panels, len(axes)):
+        axes[j].axis("off")
+
+    window = ""
+    if tmin is not None or tmax is not None:
+        window = f" (window: {tmin if tmin is not None else '-inf'} to {tmax if tmax is not None else 'inf'})"
+
+    fig.suptitle(
+        f"Run-to-run variability vs Chain Length — {ylab}{window}",
         y=1.02,
         fontsize=14,
     )
