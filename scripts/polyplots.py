@@ -613,6 +613,7 @@ def plot_property_vs_chainlength_by_func(
     min_points: int = 1,
     ncols: int = 3,
     show_errorbars: bool = True,
+    ylim: tuple[float, float] | None = None,
     outpath: Path | None = None,
     dpi: int = 300,
     verbose: bool = True,
@@ -632,6 +633,7 @@ def plot_property_vs_chainlength_by_func(
     """
 
     base_root = Path(base_root)
+    plt.style.use("seaborn-v0_8-colorblind")
 
     # --- parser for both single- and multi-series polystat-style files ---
     def parse_polystat_xvg(path: Path):
@@ -793,7 +795,8 @@ def plot_property_vs_chainlength_by_func(
 
         for solvent in solvents:
             base_solvent = base_root / solvent
-
+            if ylim is not None:
+                    ax.set_ylim(ylim)
             xs, means, stds = [], [], []
 
             for carbon in carbons:
@@ -817,16 +820,7 @@ def plot_property_vs_chainlength_by_func(
                 continue
 
             if show_errorbars:
-                ax.errorbar(
-                    xs[ok],
-                    means[ok],
-                    yerr=stds[ok],
-                    marker="o",
-                    linewidth=2,
-                    capsize=3,
-                    label=solvent,
-                )
-            else:
+                # Plot mean line
                 ax.plot(
                     xs[ok],
                     means[ok],
@@ -835,6 +829,23 @@ def plot_property_vs_chainlength_by_func(
                     label=solvent,
                 )
 
+                # Shaded ±1 std region
+                ax.fill_between(
+                    xs[ok],
+                    means[ok] - stds[ok],
+                    means[ok] + stds[ok],
+                    alpha=0.25,
+                )
+
+            else:
+                ax.plot(
+                    xs[ok],
+                    means[ok],
+                    marker="o",
+                    linewidth=2,
+                    label=solvent,
+                )
+               
             plotted = True
 
         ax.set_title(f"{func}% functionalization")
@@ -1380,6 +1391,7 @@ def plot_property_std_vs_chainlength_by_func(
     drop_nonfinite: bool = True,
     min_points: int = 1,
     ncols: int = 3,
+    ylim: tuple[float, float] | None = (0.0, 3.5),
     outpath: Path | None = None,
     dpi: int = 300,
     verbose: bool = True,
@@ -1574,7 +1586,8 @@ def plot_property_std_vs_chainlength_by_func(
         ax.set_title(f"{func}% functionalization")
         ax.set_xlabel("Carbon chain length")
         ax.set_ylabel(f"std across runs of ⟨{ylab}⟩")
-
+        if ylim is not None:
+            ax.set_ylim(*ylim)
         ax.grid(alpha=0.25)
         if plotted:
             ax.legend(frameon=False, fontsize=9)
@@ -1589,7 +1602,7 @@ def plot_property_std_vs_chainlength_by_func(
         window = f" (window: {tmin if tmin is not None else '-inf'} to {tmax if tmax is not None else 'inf'})"
 
     fig.suptitle(
-        f"Run-to-run variability vs Chain Length — {ylab}{window}",
+        f"Standard Deviation vs Chain Length — {ylab}{window}",
         y=1.02,
         fontsize=14,
     )
